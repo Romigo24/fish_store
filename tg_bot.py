@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+import sys
 from io import BytesIO
 
 import requests
@@ -30,27 +31,40 @@ def init_strapi_session(api_url, token):
     return session
 
 
-def get_or_create_cart(session, api_url, telegram_id):
-    """Возвращает существующую корзину или создает новую."""
+def get_cart_by_telegram_id(session, api_url, telegram_id):
+    """Получает корзину пользователя по telegram_id."""
     try:
         response = session.get(
             f"{api_url}/api/carts",
             params={"filters[telegram_id][$eq]": str(telegram_id)}
         )
         response.raise_for_status()
-        data = response.json()
-        
-        if data.get('data') and data['data']:
-            return data['data'][0]
-        
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Ошибка получения корзины: {e}")
+        return None
+
+
+def create_new_cart(session, api_url, telegram_id):
+    """Создает новую корзину для пользователя."""
+    try:
         cart_data = {"data": {"telegram_id": str(telegram_id)}}
         response = session.post(f"{api_url}/api/carts", json=cart_data)
         response.raise_for_status()
         return response.json().get('data', {})
-    
     except requests.exceptions.RequestException as e:
-        logging.error(f"Ошибка работы с корзиной: {e}")
+        logging.error(f"Ошибка создания корзины: {e}")
         return None
+
+
+def get_or_create_cart(session, api_url, telegram_id):
+    """Возвращает существующую корзину или создает новую."""
+    cart_data = get_cart_by_telegram_id(session, api_url, telegram_id)
+
+    if cart_data and cart_data.get('data') and cart_data['data']:
+        return cart_data['data'][0]
+
+    return create_new_cart(session, api_url, telegram_id)
 
 
 def get_cart_items(session, api_url, cart_documentId):
@@ -97,13 +111,6 @@ def remove_from_cart(session, api_url, document_id, telegram_id):
         return False
 
 
-# def clear_cart(session, api_url, cart_documentId, telegram_id):
-#     """Очищает корзину."""
-#     items = get_cart_items(session, api_url, cart_documentId)
-#     for item in items:
-#         remove_from_cart(session, api_url, item['documentId'], telegram_id)
-
-
 def fetch_products(session, api_url):
     """Возвращает список товаров из CMS."""
     try:
@@ -137,14 +144,14 @@ def get_product_details(session, api_url, document_id):
         params = {"filters[documentId][$eq]": document_id, "populate": "*"}
         response = session.get(f"{api_url}/api/products", params=params)
         response.raise_for_status()
-        data = response.json()
-        return data['data'][0] if data.get('data') else None
+        product_data = response.json()
+        return product_data['data'][0] if product_data.get('data') else None
     except (requests.exceptions.RequestException, IndexError) as e:
         logging.error(f"Ошибка получения товара: {e}")
         return None
 
 
-def safe_edit_message(query, context, text, reply_markup=None, parse_mode=None):
+def edit_message_or_send_new(query, context, text, reply_markup=None, parse_mode=None):
     """Безопасно редактирует сообщение или отправляет новое."""
     try:
         query.edit_message_text(
@@ -334,13 +341,16 @@ def handle_menu(update: Update, context: CallbackContext):
     elif callback_data == "checkout":
         cart = get_or_create_cart(session, api_url, chat_id)
         if cart and cart.get('documentId'):
-            remove_from_cart(session, api_url, cart['documentId'], str(chat_id))
+            items = get_cart_items(session, api_url, cart['documentId'])
+            for item in items:
+                remove_from_cart(session, api_url, item['documentId'], str(chat_id))
+
             context.bot.send_message(
                 chat_id=chat_id,
                 text="✅ Заказ оформлен! Спасибо за покупку!\nСкоро с вами свяжется менеджер."
             )
             return start(update, context)
-    
+
     elif callback_data == "back_to_menu":
         reply_markup = build_main_menu(session, api_url)
         if not reply_markup:
@@ -382,7 +392,7 @@ def handle_cart(update: Update, context: CallbackContext):
     
     elif callback_data == "checkout":
         keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data="cancel_email")]]
-        safe_edit_message(
+        edit_message_or_send_new(
             query,
             context,
             "📧 Введите ваш email для оформления заказа:",
@@ -463,7 +473,9 @@ def handle_email(update, context):
         if save_client_to_cms(session, api_url, email, chat_id, name):
             cart = get_or_create_cart(session, api_url, chat_id)
             if cart and cart.get('documentId'):
-                remove_from_cart(session, api_url, cart['documentId'], str(chat_id))
+                items = get_cart_items(session, api_url, cart['documentId'])
+                for item in items:
+                    remove_from_cart(session, api_url, item['documentId'], str(chat_id))
             
             update.message.reply_text(
                 '✅ Спасибо за заказ!\n'
@@ -502,20 +514,20 @@ if __name__ == '__main__':
         level=logging.INFO
     )
     load_dotenv()
-    TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
-    STRAPI_URL = os.environ['STRAPI_URL']
-    STRAPI_TOKEN = os.environ['STRAPI_TOKEN']
+    telegram_token = os.environ['TELEGRAM_TOKEN']
+    strapi_url = os.environ['STRAPI_URL']
+    strapi_token = os.environ['STRAPI_TOKEN']
     
-    if not TELEGRAM_TOKEN or not STRAPI_TOKEN:
+    if not telegram_token or not strapi_token:
         logging.error("Не заданы обязательные переменные окружения!")
-        exit(1)
+        sys.exit(1)
     
-    updater = Updater(token=TELEGRAM_TOKEN)
+    updater = Updater(token=telegram_token)
     dispatcher = updater.dispatcher
     
-    strapi_session = init_strapi_session(api_url=STRAPI_URL, token=STRAPI_TOKEN)
+    strapi_session = init_strapi_session(api_url=strapi_url, token=strapi_token)
     dispatcher.bot_data['strapi_session'] = strapi_session
-    dispatcher.bot_data['api_url'] = STRAPI_URL
+    dispatcher.bot_data['api_url'] = strapi_url
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
